@@ -40,6 +40,8 @@ export interface RoomInfo {
   viewerCount: number;
   hostOnline: boolean;
   createdAt: number;
+  /** True bila host mengaktifkan "room publik" (tampil di daftar room publik). */
+  isPublic: boolean;
 }
 
 export interface CreateRoomResponse {

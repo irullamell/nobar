@@ -15,9 +15,15 @@ tanpa server Go, tanpa WebSocket, tanpa VPS.
 ## Fitur
 
 - 🎬 **Berbagi layar + audio** dari browser host (P2P WebRTC mesh, hingga 20 penonton).
-- 🔒 **Invite-only secara default** — tidak ada daftar room publik; room hanya bisa
-  dimasuki dengan **kode undangan 12 karakter** acak kriptografis (anti-tebak/enumerasi).
+- 🔒 **Invite-only secara default** — room hanya bisa dimasuki dengan **kode undangan
+  12 karakter** acak kriptografis (anti-tebak/enumerasi).
+- 🌐 **Room publik opsional** — host bisa mengaktifkannya saat membuat room atau dari
+  dalam room ("Jadikan Publik"); room publik tampil di **daftar Room Publik** di beranda
+  (auto-refresh 15 detik) dan bisa langsung digabung. Bisa diprivat-kan kembali kapan saja.
 - 🔑 **Password room opsional** (di-hash sha256 + salt, tidak pernah disimpan polos).
+  **Ganti/hapus password langsung dari dalam room** — otomatis ter-update untuk semua
+  orang, **tanpa menendang** penonton yang sudah bergabung (password baru hanya diminta
+  dari peserta yang masuk berikutnya).
 - 🚫 **Host bisa Kick & Ban**:
   - **Kick** — keluarkan penonton (masih bisa masuk lagi lewat undangan).
   - **Ban** — keluarkan + larang masuk kembali (menempel pada identitas browser *dan* hash IP, per room). Bisa di-**unban** dari Daftar Ban.
@@ -35,12 +41,13 @@ Browser host/viewer
 Vercel
  ├─ Static frontend (React + Vite, folder dist/)
  └─ Serverless Functions (folder api/)
-     ├─ POST /api/rooms                 buat room
+     ├─ POST /api/rooms                 buat room (opsi public: true)
+     ├─ GET  /api/rooms?list=public     daftar room publik
      ├─ GET  /api/rooms/:code           info room (butuh tahu kodenya)
      ├─ POST /api/rooms/:code/join      join (cek ban + password + kapasitas)
      ├─ GET  /api/rooms/:code/events    SSE stream (signaling/chat/event)
      ├─ POST /api/rooms/:code/messages  kirim chat/reaksi/sinyal WebRTC
-     ├─ POST /api/rooms/:code/host      aksi host: kick/ban/unban/password/tutup
+     ├─ POST /api/rooms/:code/host      aksi host: kick/ban/unban/password/publik/tutup
      ├─ POST /api/rooms/:code/heartbeat presence
      └─ POST /api/rooms/:code/leave     keluar
    │
@@ -87,11 +94,15 @@ vercel --prod
 
 ### 3. Pakai
 
-1. Buka situs Anda → **Buat Room** → pilih nama, password (opsional), maks penonton.
+1. Buka situs Anda → **Buat Room** → pilih nama, password (opsional), maks penonton,
+   dan centang **🌐 Jadikan room publik** bila ingin room terlihat di daftar publik.
 2. Klik **Salin Undangan** → kirim link-nya ke teman (WhatsApp/Discord/dll).
 3. Klik **Mulai Berbagi** → pilih layar/jendela/tab.
-4. Teman membuka link, masukkan nama (+password bila ada) → gambar muncul otomatis.
+4. Teman membuka link (atau memilih room dari daftar **🌐 Room Publik** di beranda),
+   masukkan nama (+password bila ada) → gambar muncul otomatis.
 5. Di panel **Peserta**, host bisa **Kick** atau **Ban** siapa pun.
+6. Di panel **Keamanan Room**, host bisa **🔑 ganti/hapus password secara langsung**
+   (otomatis berlaku, tanpa menendang peserta lama) dan **🌐 publik/🔒 privat**-kan room.
 
 ## Pengembangan Lokal
 
@@ -101,7 +112,7 @@ npm run dev:api   # terminal 1: API lokal di :8787 (in-memory bila tanpa env Red
 npm run dev       # terminal 2: frontend di :5173 (proxy /api ke :8787)
 ```
 
-Smoke test end-to-end (39 pemeriksaan: password, ban, kick, kapasitas, dll.):
+Smoke test end-to-end (54 pemeriksaan: password tanpa kick, ban, kick, room publik, kapasitas, dll.):
 
 ```sh
 npm run dev:api   # jalankan dulu di terminal lain
@@ -115,8 +126,9 @@ npm run test:api
 
 | Ancaman | Mitigasi |
 | --- | --- |
-| Orang asing masuk room | Tidak ada daftar/enumerasi room; kode 12 karakter acak kriptografis (~71 bit entropi); join wajib kode, plus password bila diaktifkan |
-| Link undangan bocor | Host bisa set password, **kick**, **ban**, atau tutup room kapan saja |
+| Orang asing masuk room privat | Room privat tidak muncul di daftar mana pun dan tidak bisa di-enumerasi; kode 12 karakter acak kriptografis (~71 bit entropi); join wajib kode, plus password bila diaktifkan |
+| Link undangan bocor | Host bisa **ganti password kapan saja dari dalam room tanpa menendang peserta lama**, **kick**, **ban**, atau tutup room |
+| Room publik | Opsional & default mati; hanya host (dengan hostToken) yang bisa mempublikasi/memprovat; daftar hanya memuat info non-rahasia (nama, kode, jumlah penonton); room kedaluwarsa/ditutup otomatis dihapus dari daftar |
 | Penonton menyamar jadi host | Aksi moderasi butuh `hostToken` rahasia (disimpan ter-hash); broadcast hanya boleh host |
 | Penyadapan sinyal antar viewer | Pesan `signal` tertarget — server hanya mengirim ke peer tujuan |
 | Brute force | Rate limit per IP: create 20/jam, join 30/menit, info 60/menit, pesan 600/menit |

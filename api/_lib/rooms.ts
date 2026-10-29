@@ -36,6 +36,8 @@ const kBans = (code: string) => `piik:bans:${code}`;
 const kBanMeta = (code: string) => `piik:banmeta:${code}`;
 const kEvents = (code: string) => `piik:events:${code}`;
 const kGone = (code: string, peerId: string) => `piik:gone:${code}:${peerId}`;
+/** Set global berisi kode room yang diaktifkan sebagai room publik. */
+const kPublicRooms = "piik:public-rooms";
 
 interface PeerRecord {
   peerId: string;
@@ -84,6 +86,7 @@ interface RoomMeta {
   maxViewers: number;
   createdAt: number;
   closed: boolean;
+  isPublic: boolean;
 }
 
 async function loadRoom(code: string): Promise<RoomMeta | null> {
@@ -98,6 +101,7 @@ async function loadRoom(code: string): Promise<RoomMeta | null> {
     maxViewers: Number(h.maxViewers ?? DEFAULT_MAX_VIEWERS),
     createdAt: Number(h.createdAt ?? 0),
     closed: h.closed === "1",
+    isPublic: h.isPublic === "1",
   };
 }
 
@@ -137,6 +141,7 @@ function roomInfoOf(meta: RoomMeta, peers: PeerRecord[], code: string): RoomInfo
     viewerCount: peers.filter((p) => p.role === "viewer").length,
     hostOnline: Boolean(host && now - host.lastSeen < PRESENCE_TIMEOUT_MS),
     createdAt: meta.createdAt,
+    isPublic: meta.isPublic,
   };
 }
 
@@ -185,6 +190,9 @@ export async function createRoom(input: { ip: string; [key: string]: unknown }):
     password = pw;
   }
 
+  // Room publik opsional (default privat / invite-only).
+  const isPublic = input.public === true;
+
   const store = getStore();
   let code = "";
   for (let attempt = 0; attempt < 10; attempt++) {
@@ -212,9 +220,11 @@ export async function createRoom(input: { ip: string; [key: string]: unknown }):
     pwHash,
     maxViewers: String(maxViewers),
     createdAt: String(now),
+    isPublic: isPublic ? "1" : "",
   };
   await store.hset(kRoom(code), meta);
   await store.expire(kRoom(code), ROOM_TTL_SECONDS);
+  if (isPublic) await store.sadd(kPublicRooms, code);
 
   const hostRecord: PeerRecord = {
     peerId: hostPeerId,
@@ -238,6 +248,7 @@ export async function createRoom(input: { ip: string; [key: string]: unknown }):
     maxViewers,
     createdAt: now,
     closed: false,
+    isPublic,
   };
   const room = roomInfoOf(roomMeta, [hostRecord], code);
   await publish(code, { type: "room-updated", room });
@@ -550,8 +561,20 @@ export async function hostAction(
     return ok({ ok: true, room });
   }
 
+  if (action === "set-public") {
+    const isPublic = input.public === true;
+    await store.hset(kRoom(code), { isPublic: isPublic ? "1" : "" });
+    if (isPublic) await store.sadd(kPublicRooms, code);
+    else await store.srem(kPublicRooms, code);
+    const peers = await loadPeers(code);
+    const room = roomInfoOf({ ...meta, isPublic }, peers, code);
+    await publish(code, { type: "room-updated", room });
+    return ok({ ok: true, room });
+  }
+
   if (action === "close") {
     await store.hset(kRoom(code), { closed: "1" });
+    await store.srem(kPublicRooms, code);
     await publish(code, { type: "room-closed" });
     // Beri waktu 60 detik agar stream SSE yang aktif sempat membaca penutupan.
     await Promise.all([
@@ -568,6 +591,39 @@ export async function hostAction(
 async function listBans(code: string): Promise<{ clientId: string }[]> {
   const meta = await getStore().hgetall(kBanMeta(code));
   return Object.keys(meta).map((clientId) => ({ clientId }));
+}
+
+// ------------------------- daftar room publik -------------------------
+
+const MAX_PUBLIC_LIST = 50;
+
+/**
+ * Daftar room yang diaktifkan publik oleh host-nya.
+ * Sambil membaca, set global dibersihkan dari room yang sudah kedaluwarsa/ditutup.
+ * Tidak membocorkan rahasia apa pun - hanya info yang sama dengan endpoint info room.
+ */
+export async function listPublicRooms(ip: string): Promise<JsonResult> {
+  if (!(await rateLimit("list-public", ip2Key(ip), 30, 60))) return err(429, "RATE_LIMITED");
+  const store = getStore();
+  const codes = (await store.smembers(kPublicRooms)).slice(0, 200);
+  const rooms: RoomInfo[] = [];
+  const dead: string[] = [];
+  for (const code of codes) {
+    if (!/^[A-Z0-9]{12}$/.test(code)) {
+      dead.push(code);
+      continue;
+    }
+    const meta = await loadRoom(code);
+    if (!meta || meta.closed || !meta.isPublic) {
+      dead.push(code);
+      continue;
+    }
+    const peers = await loadPeers(code);
+    rooms.push(roomInfoOf(meta, peers, code));
+  }
+  if (dead.length) await store.srem(kPublicRooms, ...dead);
+  rooms.sort((a, b) => b.createdAt - a.createdAt);
+  return ok({ rooms: rooms.slice(0, MAX_PUBLIC_LIST) });
 }
 
 // ------------------------- leave -------------------------

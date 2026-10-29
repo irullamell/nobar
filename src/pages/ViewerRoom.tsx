@@ -37,6 +37,7 @@ export function ViewerRoom({ code, onExit }: ViewerRoomProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const sessionRef = useRef<RoomSession | null>(null);
   const connRef = useRef<ViewerConnection | null>(null);
+  const prevRoomRef = useRef<RoomInfo | null>(null);
   const chatSeq = useRef(0);
 
   const addChat = useCallback((msg: Omit<ChatMessage, "key">) => {
@@ -59,6 +60,7 @@ export function ViewerRoom({ code, onExit }: ViewerRoomProps) {
       .then((result) => {
         if (cancelled) return;
         setRoom(result.room);
+        prevRoomRef.current = result.room;
         setPhase("form");
       })
       .catch((e: unknown) => {
@@ -90,6 +92,7 @@ export function ViewerRoom({ code, onExit }: ViewerRoomProps) {
       {
         onJoined(info: JoinResponse) {
           setRoom(info.room);
+          prevRoomRef.current = info.room;
           setPeers(info.peers);
           setChat(info.chatHistory.map((m, i) => ({ key: `h${i}`, name: m.name, text: m.text, self: false })));
           const hostPeer = info.peers.find((p) => p.role === "host");
@@ -124,9 +127,35 @@ export function ViewerRoom({ code, onExit }: ViewerRoomProps) {
               setPeers((prev) => prev.filter((p) => p.peerId !== peerId));
               break;
             }
-            case "room-updated":
-              setRoom(ev.data.room as RoomInfo);
+            case "room-updated": {
+              const updated = ev.data.room as RoomInfo;
+              const prev = prevRoomRef.current;
+              if (prev) {
+                if (prev.passwordProtected !== updated.passwordProtected) {
+                  addChat({
+                    name: "",
+                    text: updated.passwordProtected
+                      ? "🔑 Host mengaktifkan/memperbarui password room — Anda yang sudah di dalam tidak terpengaruh"
+                      : "🔓 Host menghapus password room",
+                    self: false,
+                    system: true,
+                  });
+                }
+                if (prev.isPublic !== updated.isPublic) {
+                  addChat({
+                    name: "",
+                    text: updated.isPublic
+                      ? "🌐 Room kini PUBLIK — tampil di daftar room publik"
+                      : "🔒 Room kini PRIVAT — hanya bisa dimasuki lewat undangan",
+                    self: false,
+                    system: true,
+                  });
+                }
+              }
+              prevRoomRef.current = updated;
+              setRoom(updated);
               break;
+            }
             case "room-closed":
               setFatal({ reason: "closed", message: "Room ditutup oleh host." });
               setPhase("fatal");
@@ -139,6 +168,7 @@ export function ViewerRoom({ code, onExit }: ViewerRoomProps) {
           setPhase("fatal");
         },
         onRoomUpdate(updated, updatedPeers) {
+          prevRoomRef.current = updated;
           setRoom(updated);
           setPeers(updatedPeers);
         },
@@ -276,6 +306,8 @@ export function ViewerRoom({ code, onExit }: ViewerRoomProps) {
           <span className="dot" />
           Host {room?.hostOnline ? "online" : "offline"}
         </span>
+        {room?.passwordProtected && <span className="badge">🔒 Password</span>}
+        {room?.isPublic && <span className="badge">🌐 Publik</span>}
         <div className="header-spacer" />
         <span className="muted">{peers.filter((p) => p.role === "viewer").length} penonton</span>
         <button className="btn btn-ghost btn-small" onClick={() => navigate("/")}>Keluar</button>

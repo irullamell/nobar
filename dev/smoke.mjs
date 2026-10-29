@@ -161,9 +161,16 @@ async function main() {
   const afterUnban = await api(`/api/rooms/${code}/join`, { name: "Sari", clientId: "client-viewer-0001", password: "rahasia123" });
   check("setelah unban bisa join lagi", afterUnban.status === 200, JSON.stringify(afterUnban.json));
 
-  console.log("12) Ganti password → viewer lama tetap, join baru wajib password baru");
+  console.log("12) Ganti password → viewer lama TIDAK ditendang, join baru wajib password baru");
   const setPw = await api(`/api/rooms/${code}/host`, { hostToken, action: "set-password", password: "baru456" });
   check("set-password 200", setPw.status === 200);
+  check("room-updated: passwordProtected true", setPw.json?.room?.passwordProtected === true, JSON.stringify(setPw.json?.room));
+  const stillIn = await api(`/api/rooms/${code}/heartbeat`, {
+    peerId: afterUnban.json.peerId, token: afterUnban.json.token,
+  });
+  check("viewer yang sudah bergabung TETAP di dalam (heartbeat 200)", stillIn.status === 200, JSON.stringify(stillIn.json));
+  const stillPeers = stillIn.json?.peers ?? [];
+  check("peer viewer masih terdaftar", stillPeers.some((p) => p.peerId === afterUnban.json.peerId));
   const oldPw = await api(`/api/rooms/${code}/join`, { name: "Orang", clientId: "client-viewer-0009", password: "rahasia123" });
   check("password lama ditolak", oldPw.status === 403);
   const newPw = await api(`/api/rooms/${code}/join`, { name: "Orang", clientId: "client-viewer-0009", password: "baru456" });
@@ -187,6 +194,40 @@ async function main() {
   await sleep(1200);
   const afterClose = await api(`/api/rooms/${code}/join`, { name: "X", clientId: "client-viewer-0012", password: "baru456" });
   check("join setelah close → 404", afterClose.status === 404, JSON.stringify(afterClose.json));
+
+  console.log("16) Room publik: daftar, toggle, dan cleanup");
+  const priv = await api("/api/rooms", { name: "Privat", hostName: "H", clientId: "client-pub-0001" });
+  const pub = await api("/api/rooms", { name: "Nobar Publik", hostName: "H2", clientId: "client-pub-0002", public: true });
+  check("create public 200 + isPublic true", pub.status === 200 && pub.json?.room?.isPublic === true, JSON.stringify(pub.json?.room));
+  check("create privat → isPublic false", priv.json?.room?.isPublic === false);
+
+  let list = await api("/api/rooms?list=public");
+  check("list 200", list.status === 200, JSON.stringify(list.json));
+  check("room publik terdaftar", (list.json?.rooms ?? []).some((r) => r.code === pub.json.code));
+  check("room privat TIDAK terdaftar", !(list.json?.rooms ?? []).some((r) => r.code === priv.json.code));
+  check("list tidak membocorkan hostToken", !JSON.stringify(list.json).includes(pub.json.hostToken));
+
+  const goPrivate = await api(`/api/rooms/${pub.json.code}/host`, { hostToken: pub.json.hostToken, action: "set-public", public: false });
+  check("set-public(false) 200", goPrivate.status === 200 && goPrivate.json?.room?.isPublic === false);
+  list = await api("/api/rooms?list=public");
+  check("hilang dari daftar setelah diprivat", !(list.json?.rooms ?? []).some((r) => r.code === pub.json.code));
+
+  const goPublic = await api(`/api/rooms/${pub.json.code}/host`, { hostToken: pub.json.hostToken, action: "set-public", public: true });
+  check("set-public(true) 200", goPublic.status === 200 && goPublic.json?.room?.isPublic === true);
+  list = await api("/api/rooms?list=public");
+  check("muncul lagi setelah dipublikkan", (list.json?.rooms ?? []).some((r) => r.code === pub.json.code));
+
+  // viewer tanpa hostToken tetap butuh kode; room publik TANPA password bisa langsung join
+  const pubJoin = await api(`/api/rooms/${pub.json.code}/join`, { name: "Penonton", clientId: "client-pub-0003" });
+  check("join room publik tanpa password 200", pubJoin.status === 200);
+
+  const viewerFake = await api(`/api/rooms/${pub.json.code}/host`, { hostToken: "bukan-host", action: "set-public", public: true });
+  check("set-public oleh non-host → 403", viewerFake.status === 403);
+
+  const pubClose = await api(`/api/rooms/${pub.json.code}/host`, { hostToken: pub.json.hostToken, action: "close" });
+  check("close room publik 200", pubClose.status === 200);
+  list = await api("/api/rooms?list=public");
+  check("room ditutup → hilang dari daftar publik", !(list.json?.rooms ?? []).some((r) => r.code === pub.json.code));
 
   sse1.abort();
   console.log(failures === 0 ? "\nSEMUA TES LULUS 🎉" : `\nADA ${failures} KEGAGALAN ❌`);

@@ -50,8 +50,16 @@ export function apiCreateRoom(input: {
   clientId: string;
   password?: string;
   maxViewers?: number;
+  public?: boolean;
 }): Promise<CreateRoomResponse> {
   return request<CreateRoomResponse>("/api/rooms", postJson("/api/rooms", input));
+}
+
+export function apiListPublicRooms(): Promise<{ rooms: RoomInfo[] }> {
+  return request<{ rooms: RoomInfo[] }>("/api/rooms?list=public", {
+    headers: { Accept: "application/json" },
+    cache: "no-store",
+  });
 }
 
 export function apiRoomInfo(code: string): Promise<{ room: RoomInfo }> {

@@ -37,7 +37,11 @@ export function HostRoom({ code, hostToken, hostName, onExit }: HostRoomProps) {
   const [floaters, setFloaters] = useState<Floater[]>([]);
 
   // Panel keamanan
+  const [pwModal, setPwModal] = useState(false);
   const [pwValue, setPwValue] = useState("");
+  const [pwError, setPwError] = useState<string | null>(null);
+  const [pwBusy, setPwBusy] = useState(false);
+  const [pwNote, setPwNote] = useState<string | null>(null);
   const [nameValue, setNameValue] = useState("");
   const [maxValue, setMaxValue] = useState(12);
   const [bans, setBans] = useState<{ clientId: string }[]>([]);
@@ -47,6 +51,7 @@ export function HostRoom({ code, hostToken, hostName, onExit }: HostRoomProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const sessionRef = useRef<RoomSession | null>(null);
   const broadcasterRef = useRef<HostBroadcaster | null>(null);
+  const prevRoomRef = useRef<RoomInfo | null>(null);
   const chatSeq = useRef(0);
 
   const inviteUrl = useMemo(() => `${window.location.origin}/r/${code}`, [code]);
@@ -70,6 +75,7 @@ export function HostRoom({ code, hostToken, hostName, onExit }: HostRoomProps) {
       {
         onJoined(info: JoinResponse) {
           setRoom(info.room);
+          prevRoomRef.current = info.room;
           setPeers(info.peers);
           setNameValue(info.room.name);
           setMaxValue(info.room.maxViewers);
@@ -109,6 +115,30 @@ export function HostRoom({ code, hostToken, hostName, onExit }: HostRoomProps) {
             }
             case "room-updated": {
               const updated = ev.data.room as RoomInfo;
+              const prev = prevRoomRef.current;
+              if (prev) {
+                if (prev.passwordProtected !== updated.passwordProtected) {
+                  addChat({
+                    name: "",
+                    text: updated.passwordProtected
+                      ? "🔑 Host mengaktifkan/memperbarui password room — peserta yang sudah bergabung tetap di dalam"
+                      : "🔓 Host menghapus password room",
+                    self: false,
+                    system: true,
+                  });
+                }
+                if (prev.isPublic !== updated.isPublic) {
+                  addChat({
+                    name: "",
+                    text: updated.isPublic
+                      ? "🌐 Room kini PUBLIK — tampil di daftar room publik"
+                      : "🔒 Room kini PRIVAT — hanya bisa dimasuki lewat undangan",
+                    self: false,
+                    system: true,
+                  });
+                }
+              }
+              prevRoomRef.current = updated;
               setRoom(updated);
               setNameValue(updated.name);
               setMaxValue(updated.maxViewers);
@@ -124,6 +154,7 @@ export function HostRoom({ code, hostToken, hostName, onExit }: HostRoomProps) {
           setFatal({ reason, message: message ?? "Sesi berakhir." });
         },
         onRoomUpdate(updated, updatedPeers) {
+          prevRoomRef.current = updated;
           setRoom(updated);
           setPeers(updatedPeers);
         },
@@ -198,6 +229,51 @@ export function HostRoom({ code, hostToken, hostName, onExit }: HostRoomProps) {
     }
   }
 
+  function flashNote(text: string): void {
+    setPwNote(text);
+    window.setTimeout(() => setPwNote((cur) => (cur === text ? null : cur)), 8000);
+  }
+
+  async function savePassword(): Promise<void> {
+    const pw = pwValue.trim();
+    if (pw.length < 4 || pw.length > 64) {
+      setPwError("Password minimal 4 karakter, maksimal 64.");
+      return;
+    }
+    setPwBusy(true);
+    setPwError(null);
+    const result = await hostCall("set-password", { password: pw });
+    setPwBusy(false);
+    if (result?.room) {
+      setRoom(result.room as RoomInfo);
+      setPwModal(false);
+      setPwValue("");
+      flashNote("🔑 Password diperbarui dan otomatis berlaku. Penonton yang SUDAH bergabung tidak dikeluarkan — password hanya diminta dari peserta yang masuk berikutnya.");
+    } else if (result === null) {
+      setPwError("Gagal menyimpan password. Coba lagi.");
+    }
+  }
+
+  async function removePassword(): Promise<void> {
+    setPwBusy(true);
+    setPwError(null);
+    const result = await hostCall("set-password", { password: null });
+    setPwBusy(false);
+    if (result?.room) {
+      setRoom(result.room as RoomInfo);
+      setPwModal(false);
+      flashNote("🔓 Password dihapus. Siapa pun dengan kode/tautan undangan bisa masuk.");
+    } else if (result === null) {
+      setPwError("Gagal menghapus password. Coba lagi.");
+    }
+  }
+
+  async function togglePublic(): Promise<void> {
+    const next = !(room?.isPublic ?? false);
+    const result = await hostCall("set-public", { public: next });
+    if (result?.room) setRoom(result.room as RoomInfo);
+  }
+
   async function kick(peer: PeerInfo): Promise<void> {
     const result = await hostCall("kick", { peerId: peer.peerId });
     if (result) {
@@ -266,6 +342,7 @@ export function HostRoom({ code, hostToken, hostName, onExit }: HostRoomProps) {
           {status === "live" ? "Terhubung" : status === "reconnecting" ? "Menyambung ulang..." : "Menghubungkan..."}
         </span>
         {room?.passwordProtected && <span className="badge">🔒 Password</span>}
+        {room?.isPublic && <span className="badge">🌐 Publik</span>}
         <div className="header-spacer" />
         <button className="btn btn-ghost btn-small" onClick={() => void copyInvite()}>
           {copied ? "✓ Tersalin" : "🔗 Salin Undangan"}
@@ -333,23 +410,25 @@ export function HostRoom({ code, hostToken, hostName, onExit }: HostRoomProps) {
 
           <div className="sidebar-section">
             <h4>Keamanan Room</h4>
+            {pwNote && <div className="notice-box">{pwNote}</div>}
             <div className="row mt">
-              <input
-                style={{ flex: 1, padding: "8px 10px", borderRadius: 8, border: "1px solid var(--border)", background: "var(--bg)", color: "var(--text)" }}
-                type="password"
-                value={pwValue}
-                onChange={(e) => setPwValue(e.target.value)}
-                placeholder={room?.passwordProtected ? "Ganti password..." : "Set password (min 4)..."}
-                maxLength={64}
-              />
-              <button className="btn btn-ghost btn-small" onClick={() => void hostCall("set-password", { password: pwValue.trim() || null }).then(() => setPwValue(""))}>
-                Set
+              <button
+                className="btn btn-ghost btn-small"
+                onClick={() => {
+                  setPwValue("");
+                  setPwError(null);
+                  setPwModal(true);
+                }}
+              >
+                🔑 {room?.passwordProtected ? "Ganti / Hapus Password" : "Set Password"}
               </button>
-              {room?.passwordProtected && (
-                <button className="btn btn-ghost btn-small" onClick={() => void hostCall("set-password", { password: null })}>
-                  Hapus
-                </button>
-              )}
+              {room?.passwordProtected ? <span className="badge">🔒 Aktif</span> : <span className="badge">Tanpa password</span>}
+            </div>
+            <div className="row mt">
+              <button className="btn btn-ghost btn-small" onClick={() => void togglePublic()} disabled={busy}>
+                {room?.isPublic ? "🔒 Buat Privat" : "🌐 Jadikan Publik"}
+              </button>
+              {room?.isPublic && <span className="badge live"><span className="dot" />Di daftar publik</span>}
             </div>
             <div className="row mt">
               <input
@@ -428,6 +507,53 @@ export function HostRoom({ code, hostToken, hostName, onExit }: HostRoomProps) {
             <div className="modal-actions">
               <button className="btn btn-ghost" onClick={() => setConfirmClose(false)}>Batal</button>
               <button className="btn btn-danger" onClick={() => void closeRoom()}>Tutup Room</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {pwModal && (
+        <div className="modal-backdrop" onClick={() => setPwModal(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>🔑 Password Room</h3>
+            <p>
+              Status saat ini:{" "}
+              {room?.passwordProtected
+                ? "password AKTIF — peserta baru wajib memasukkan password."
+                : "TANPA password — siapa pun yang tahu kode/tautan undangan bisa masuk."}
+            </p>
+            <div className="notice-box">
+              Mengganti password berlaku <strong>otomatis &amp; langsung</strong> untuk semua orang,
+              dan <strong>tidak mengeluarkan</strong> penonton yang sudah bergabung — password baru
+              hanya diminta dari peserta yang masuk berikutnya.
+            </div>
+            <div className="field">
+              <label htmlFor="pw-new">Password baru (4–64 karakter)</label>
+              <input
+                id="pw-new"
+                type="password"
+                value={pwValue}
+                onChange={(e) => setPwValue(e.target.value)}
+                placeholder="mis. nonton2026"
+                maxLength={64}
+                autoComplete="new-password"
+                autoFocus
+              />
+            </div>
+            {pwError && <div className="error-box">{pwError}</div>}
+            <div className="modal-actions">
+              {room?.passwordProtected && (
+                <button className="btn btn-ghost" onClick={() => void removePassword()} disabled={pwBusy}>
+                  Hapus Password
+                </button>
+              )}
+              <div className="header-spacer" />
+              <button className="btn btn-ghost" onClick={() => setPwModal(false)} disabled={pwBusy}>
+                Batal
+              </button>
+              <button className="btn btn-primary" onClick={() => void savePassword()} disabled={pwBusy || pwValue.trim().length < 4}>
+                {pwBusy ? "Menyimpan..." : "Simpan Password"}
+              </button>
             </div>
           </div>
         </div>
