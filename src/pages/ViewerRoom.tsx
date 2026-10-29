@@ -102,6 +102,10 @@ export function ViewerRoom({ code, onExit }: ViewerRoomProps) {
           prevRoomRef.current = info.room;
           setPeers(info.peers);
           setChat(info.chatHistory.map((m, i) => ({ key: `h${i}`, name: m.name, text: m.text, self: false })));
+          // Join pertama ATAU rejoin (pemulihan presence): peerId viewer bisa
+          // berganti, jadi buang koneksi media lama dan minta offer baru.
+          connRef.current?.reset();
+          setViewerStatus("waiting-host");
           const hostPeer = info.peers.find((p) => p.role === "host");
           connRef.current?.setHostPeerId(hostPeer?.peerId ?? null);
           if (hostPeer) {

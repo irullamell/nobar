@@ -175,6 +175,25 @@ async function verifyPeer(code: string, peerId: unknown, token: unknown): Promis
   }
 }
 
+/**
+ * Refresh lastSeen peer TANPA validasi token - dipanggil dari loop SSE.
+ * Inilah kunci presence yang andal: koneksi SSE adalah kanal jaringan yang
+ * tidak di-throttle browser (berbeda dengan setInterval di tab background),
+ * jadi selama stream hidup, peer dianggap online.
+ */
+async function refreshPeer(code: string, peerId: string): Promise<void> {
+  const store = getStore();
+  const raw = await store.hget(kPeers(code), peerId);
+  if (!raw) return;
+  try {
+    const p = JSON.parse(raw) as PeerRecord;
+    p.lastSeen = Date.now();
+    await store.hset(kPeers(code), { [peerId]: JSON.stringify(p) });
+  } catch {
+    /* record rusak; biarkan di-prune */
+  }
+}
+
 // ------------------------- create -------------------------
 
 export async function createRoom(input: { ip: string; [key: string]: unknown }): Promise<JsonResult> {
@@ -695,10 +714,11 @@ export async function streamEvents(
       }
     }
 
-    // Prune peer mati maksimal tiap 10 detik dari loop ini.
+    // Prune peer mati + refresh presence sendiri, maksimal tiap 10 detik.
     const now = Date.now();
     if (now - lastPrune > 10_000) {
       lastPrune = now;
+      await refreshPeer(code, peer.peerId);
       await loadPeers(code);
     }
 

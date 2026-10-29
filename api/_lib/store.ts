@@ -2,6 +2,7 @@
 // in-memory untuk pengembangan lokal tanpa Redis.
 // Hanya memakai subset perintah yang dibutuhkan logika room.
 
+import * as fs from "node:fs";
 import { Redis } from "@upstash/redis";
 
 export interface StreamEntry {
@@ -117,6 +118,62 @@ class MemoryStore implements Store {
   private data = new Map<string, MemEntry>();
   private streams = new Map<string, StreamEntry[]>();
   private streamSeq = new Map<string, number>();
+  private streamExpiry = new Map<string, number>();
+  private persistTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly persistFile: string | null;
+
+  constructor() {
+    // Persistensi opsional untuk dev: room bertahan lintas restart server.
+    this.persistFile = process.env.PIIK_DEV_STORE_FILE ?? null;
+    if (this.persistFile) this.loadFromDisk();
+  }
+
+  private loadFromDisk(): void {
+    try {
+      if (!this.persistFile || !fs.existsSync(this.persistFile)) return;
+      const snapshot = JSON.parse(fs.readFileSync(this.persistFile, "utf8")) as {
+        data: [string, MemEntry][];
+        streams: [string, StreamEntry[]][];
+        streamSeq: [string, number][];
+        streamExpiry: [string, number][];
+      };
+      this.data = new Map(snapshot.data ?? []);
+      this.streams = new Map(snapshot.streams ?? []);
+      this.streamSeq = new Map(snapshot.streamSeq ?? []);
+      this.streamExpiry = new Map(snapshot.streamExpiry ?? []);
+      // Set disimpan sebagai array di JSON - hidupkan kembali.
+      for (const entry of this.data.values()) {
+        if (entry && Array.isArray(entry.value)) entry.value = new Set(entry.value as string[]);
+      }
+      console.log(`[store] in-memory + persistensi disk (${this.persistFile})`);
+    } catch (e) {
+      console.warn("[store] gagal memuat snapshot dev:", e);
+    }
+  }
+
+  private schedulePersist(): void {
+    if (!this.persistFile || this.persistTimer) return;
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = null;
+      try {
+        const serializable = [...this.data].map(([k, v]) => [
+          k,
+          { value: v.value instanceof Set ? [...v.value] : v.value, expiresAt: v.expiresAt },
+        ]);
+        fs.writeFileSync(
+          this.persistFile!,
+          JSON.stringify({
+            data: serializable,
+            streams: [...this.streams],
+            streamSeq: [...this.streamSeq],
+            streamExpiry: [...this.streamExpiry],
+          }),
+        );
+      } catch (e) {
+        console.warn("[store] gagal persist dev:", e);
+      }
+    }, 400);
+  }
 
   private live(key: string): MemEntry | null {
     const entry = this.data.get(key);
@@ -129,6 +186,7 @@ class MemoryStore implements Store {
   }
   private put(key: string, value: unknown, exSeconds?: number): void {
     this.data.set(key, { value, expiresAt: exSeconds ? Date.now() + exSeconds * 1000 : null });
+    this.schedulePersist();
   }
 
   async hset(key: string, fields: Record<string, string>): Promise<void> {
@@ -148,6 +206,7 @@ class MemoryStore implements Store {
     const hash = this.live(key)?.value as Record<string, string> | undefined;
     if (!hash) return;
     for (const f of fields) delete hash[f];
+    this.schedulePersist();
   }
   async set(key: string, value: string, exSeconds?: number): Promise<void> {
     this.put(key, value, exSeconds);
@@ -159,7 +218,10 @@ class MemoryStore implements Store {
     for (const k of keys) {
       this.data.delete(k);
       this.streams.delete(k);
+      this.streamSeq.delete(k);
+      this.streamExpiry.delete(k);
     }
+    this.schedulePersist();
   }
   private setOf(key: string): Set<string> {
     const entry = this.live(key);
@@ -171,10 +233,12 @@ class MemoryStore implements Store {
   async sadd(key: string, ...members: string[]): Promise<void> {
     const s = this.setOf(key);
     for (const m of members) s.add(m);
+    this.schedulePersist();
   }
   async srem(key: string, ...members: string[]): Promise<void> {
     const s = this.setOf(key);
     for (const m of members) s.delete(m);
+    this.schedulePersist();
   }
   async smembers(key: string): Promise<string[]> {
     const entry = this.live(key);
@@ -188,6 +252,7 @@ class MemoryStore implements Store {
     const entry = this.live(key);
     const next = ((entry?.value as number | undefined) ?? 0) + 1;
     this.data.set(key, { value: next, expiresAt: entry?.expiresAt ?? null });
+    this.schedulePersist();
     return next;
   }
   async expire(key: string, seconds: number): Promise<void> {
@@ -195,8 +260,8 @@ class MemoryStore implements Store {
     if (entry) entry.expiresAt = Date.now() + seconds * 1000;
     const stream = this.streams.get(key);
     if (stream) this.streamExpiry.set(key, Date.now() + seconds * 1000);
+    this.schedulePersist();
   }
-  private streamExpiry = new Map<string, number>();
   async xadd(key: string, fields: Record<string, string>): Promise<string> {
     const exp = this.streamExpiry.get(key);
     if (exp && exp < Date.now()) {
@@ -211,9 +276,16 @@ class MemoryStore implements Store {
     list.push({ id, fields: { ...fields } });
     if (list.length > 2000) list.splice(0, list.length - 2000);
     this.streams.set(key, list);
+    this.schedulePersist();
     return id;
   }
   async xrangeAfter(key: string, afterId: string | null, count: number): Promise<StreamEntry[]> {
+    const exp = this.streamExpiry.get(key);
+    if (exp && exp < Date.now()) {
+      this.streams.delete(key);
+      this.streamExpiry.delete(key);
+      return [];
+    }
     const list = this.streams.get(key) ?? [];
     const startIdx = afterId
       ? list.findIndex((e) => compareStreamIds(e.id, afterId) > 0)

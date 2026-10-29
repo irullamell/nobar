@@ -268,7 +268,8 @@ export class ViewerConnection {
     }
   }
 
-  private teardown(): void {
+  /** Buang koneksi lama tanpa mengubah status (mis. setelah sesi rejoin). */
+  reset(): void {
     if (this.pc) {
       this.pc.ontrack = null;
       this.pc.onicecandidate = null;
@@ -277,6 +278,10 @@ export class ViewerConnection {
       this.pc = null;
     }
     this.pendingCandidates = [];
+  }
+
+  private teardown(): void {
+    this.reset();
     this.onStream(null);
   }
 

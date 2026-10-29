@@ -1,5 +1,19 @@
 // RoomSession: bergabung, menjaga koneksi SSE (pengganti WebSocket di Vercel),
 // heartbeat presence, kirim pesan, dan aksi host.
+//
+// Prinsip ketahanan (penting di Vercel):
+// - Server menutup tiap stream SSE di batas durasi function (±50 dtk), dan
+//   Vercel bisa MEMUTUS PAKSA function (mis. paket Hobby 10 dtk). Keduanya
+//   adalah siklus normal: selama stream pernah hidup >= HEALTHY_STREAM_MIN_MS,
+//   reconnect dilakukan SENYAP (status tetap "live") karena cursor Redis
+//   menjamin tidak ada event yang hilang.
+// - Status "reconnecting" hanya ditampilkan bila stream gagal/berakhir sangat
+//   cepat secara BERUNTUN (masalah sungguhan), dengan backoff.
+// - Presence dipertahankan oleh heartbeat (15 dtk) + refresh lastSeen dari
+//   loop SSE di server; timeout server longgar (120 dtk) agar tab background
+//   yang di-throttle browser tidak dianggap offline.
+// - Bila presence terlanjur kedaluwarsa (you-removed timeout), sesi melakukan
+//   REJOIN SENYAP - pengguna tidak ditendang dari room.
 import {
   HEARTBEAT_INTERVAL_MS,
   type JoinResponse,
@@ -33,6 +47,13 @@ export interface SessionCredentials {
   hostToken?: string;
 }
 
+/** Stream yang hidup sepanjang ini dianggap siklus sehat walau berakhir kasar. */
+const HEALTHY_STREAM_MIN_MS = 3_000;
+/** Server mengirim ping tiap ±15 dtk; tanpa byte selama ini = stream mati. */
+const STALL_TIMEOUT_MS = 45_000;
+/** Saat tab visible lagi, paksa refresh stream bila sunyi lebih dari ini. */
+const REFRESH_ON_VISIBLE_AFTER_MS = 20_000;
+
 export class RoomSession {
   peerId = "";
   token = "";
@@ -44,9 +65,12 @@ export class RoomSession {
   private stopped = false;
   private abort: AbortController | null = null;
   private heartbeatTimer: number | null = null;
-  private reconnectTimer: number | null = null;
+  private watchdogTimer: number | null = null;
+  private lastActivity = 0;
   private processedIds = new Set<string>();
   private lastProcessedId: string | null = null;
+  private rejoinPromise: Promise<boolean> | null = null;
+  private visibilityHandler: (() => void) | null = null;
 
   constructor(
     private readonly creds: SessionCredentials,
@@ -56,6 +80,8 @@ export class RoomSession {
   async start(): Promise<void> {
     this.stopped = false;
     await this.join();
+    if (this.stopped) return;
+    this.attachVisibility();
     this.heartbeatTimer = window.setInterval(() => void this.heartbeat(), HEARTBEAT_INTERVAL_MS);
     void this.sseLoop();
   }
@@ -97,8 +123,18 @@ export class RoomSession {
     }
   }
 
+  /** Rejoin terdeduplikasi: panggilan paralel berbagi satu promise. */
+  private ensureRejoin(): Promise<boolean> {
+    if (!this.rejoinPromise) {
+      this.rejoinPromise = this.rejoin().finally(() => {
+        this.rejoinPromise = null;
+      });
+    }
+    return this.rejoinPromise;
+  }
+
   private fatal(reason: SessionFatalReason, message?: string): void {
-    this.stopInternal(false);
+    this.stopInternal();
     this.cb.onFatal(reason, message);
   }
 
@@ -110,9 +146,10 @@ export class RoomSession {
       this.peers = result.peers;
       this.cb.onRoomUpdate(result.room, result.peers);
     } catch (error) {
+      if (this.stopped) return;
       if (error instanceof ApiError && error.status === 401) {
         // Sesi hilang di server: coba masuk ulang dengan kredensial yang sama.
-        if (await this.rejoin()) this.setStatus("live");
+        if (await this.ensureRejoin()) this.setStatus("live");
       } else if (error instanceof ApiError && error.status === 404) {
         this.fatal("closed", error.message || "Room ditutup atau sudah kedaluwarsa.");
       }
@@ -120,30 +157,60 @@ export class RoomSession {
     }
   }
 
+  /** Pulihkan presence yang kedaluwarsa tanpa menendang pengguna. */
+  private async handlePresenceReset(): Promise<void> {
+    if (this.stopped) return;
+    const okJoin = await this.ensureRejoin();
+    if (!okJoin && !this.stopped) {
+      this.fatal("timeout", "Koneksi presence kedaluwarsa dan gagal memulihkan sesi.");
+    }
+  }
+
+  private attachVisibility(): void {
+    if (typeof document === "undefined" || this.visibilityHandler) return;
+    this.visibilityHandler = () => {
+      if (this.stopped || document.visibilityState !== "visible") return;
+      // Tab aktif lagi: segera heartbeat; bila stream tampak mati (tab tadi
+      // tidur), paksa putus agar loop menyambung ulang dengan cepat.
+      void this.heartbeat();
+      if (Date.now() - this.lastActivity > REFRESH_ON_VISIBLE_AFTER_MS) this.abort?.abort();
+    };
+    document.addEventListener("visibilitychange", this.visibilityHandler);
+  }
+
+  private detachVisibility(): void {
+    if (this.visibilityHandler && typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", this.visibilityHandler);
+    }
+    this.visibilityHandler = null;
+  }
+
   private async sseLoop(): Promise<void> {
-    // quickEnds menghitung stream yang berakhir terlalu cepat/gagal beruntun.
-    // Siklus normal (server menutup stream tiap ±50 dtk karena batas durasi
-    // function) TIDAK mengubah status - reconnect dilakukan senyap karena
-    // cursor menjamin tidak ada event yang hilang.
+    // quickEnds: jumlah stream beruntun yang gagal/berakhir sangat cepat.
+    // Siklus normal (server menutup stream di batas durasi function, atau
+    // Vercel memutus paksa setelah stream hidup beberapa detik) TIDAK mengubah
+    // status - reconnect senyap karena cursor menjamin tidak ada event hilang.
     let quickEnds = 0;
     while (!this.stopped) {
+      if (this.rejoinPromise) {
+        await this.rejoinPromise;
+        if (this.stopped) return;
+      }
+
       const startedAt = Date.now();
-      let streamFailed = false;
+      let healthy = false;
       try {
-        await this.openStream();
+        await this.openStream(startedAt);
+        healthy = Date.now() - startedAt >= HEALTHY_STREAM_MIN_MS;
       } catch {
-        streamFailed = true;
+        healthy = false;
       }
       if (this.stopped) return;
 
-      const duration = Date.now() - startedAt;
-      // Berakhir normal setelah >1,5 dtk = siklus periodik yang sehat (server
-      // memang menutup stream di batas durasi function; cursor menjaga event).
-      // Gagal/berakhir sangat cepat = mencurigakan → hitung untuk backoff.
-      if (!streamFailed && duration >= 1_500) quickEnds = 0;
+      if (healthy) quickEnds = 0;
       else quickEnds = Math.min(quickEnds + 1, 10);
 
-      const degraded = streamFailed || quickEnds >= 2;
+      const degraded = quickEnds >= 2;
       if (degraded) this.setStatus("reconnecting");
       // else: status dibiarkan "live" (reconnect senyap)
 
@@ -160,7 +227,7 @@ export class RoomSession {
         } catch (error) {
           if (this.stopped) return;
           if (error instanceof ApiError && error.status === 401) {
-            if (!(await this.rejoin())) return;
+            if (!(await this.ensureRejoin())) return;
           } else if (error instanceof ApiError && error.status === 404) {
             this.fatal("closed", error.message || "Room ditutup atau sudah kedaluwarsa.");
             return;
@@ -170,7 +237,7 @@ export class RoomSession {
     }
   }
 
-  private async openStream(): Promise<void> {
+  private async openStream(startedAt: number): Promise<void> {
     this.abort = new AbortController();
     const params = new URLSearchParams({ peerId: this.peerId });
     if (this.cursor) params.set("cursor", this.cursor);
@@ -204,18 +271,39 @@ export class RoomSession {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    this.lastActivity = Date.now();
 
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let sep: number;
-      while ((sep = buffer.indexOf("\n\n")) !== -1) {
-        const frame = buffer.slice(0, sep);
-        buffer = buffer.slice(sep + 2);
-        this.handleFrame(frame);
-        if (this.stopped) return;
+    // Watchdog: server selalu mengirim data/ping tiap ±15 dtk. Tanpa byte
+    // selama 45 dtk berarti koneksi setengah mati (mis. pindah jaringan) -
+    // putuskan agar loop reconnect.
+    this.watchdogTimer = window.setInterval(() => {
+      if (Date.now() - this.lastActivity > STALL_TIMEOUT_MS) this.abort?.abort();
+    }, 5_000);
+
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        this.lastActivity = Date.now();
+        buffer += decoder.decode(value, { stream: true });
+        let sep: number;
+        while ((sep = buffer.indexOf("\n\n")) !== -1) {
+          const frame = buffer.slice(0, sep);
+          buffer = buffer.slice(sep + 2);
+          this.handleFrame(frame);
+          if (this.stopped) return;
+        }
       }
+    } catch (error) {
+      if (this.stopped) return;
+      // Pemutusan KASAR setelah stream sempat hidup sehat (Vercel membunuh
+      // function di maxDuration, proxy menutup koneksi, dsb.) diperlakukan
+      // seperti siklus normal: kembali senyap, loop akan reconnect.
+      if (Date.now() - startedAt >= HEALTHY_STREAM_MIN_MS) return;
+      throw error;
+    } finally {
+      if (this.watchdogTimer !== null) window.clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
     }
   }
 
@@ -250,11 +338,11 @@ export class RoomSession {
       if (reason === "kicked") this.fatal("kicked", "Anda dikeluarkan (kick) oleh host.");
       else if (reason === "banned") this.fatal("banned", "Anda di-ban oleh host dan tidak dapat masuk kembali.");
       else if (reason === "closed") this.fatal("closed", "Room ditutup oleh host.");
-      else this.fatal("timeout", "Koneksi presence kedaluwarsa.");
+      else void this.handlePresenceReset(); // timeout → pulihkan senyap
       return;
     }
     if (type === "error") {
-      if (String(parsed.error) === "SESSION_EXPIRED") void this.heartbeat();
+      if (String(parsed.error) === "SESSION_EXPIRED") void this.ensureRejoin();
       return;
     }
     this.cb.onEvent({ id, type, data: parsed });
@@ -290,7 +378,7 @@ export class RoomSession {
   leave(): void {
     const payload = { peerId: this.peerId, token: this.token };
     const code = this.creds.code;
-    this.stopInternal(false);
+    this.stopInternal();
     if (payload.peerId) {
       // best-effort; pakai keepalive agar tetap terkirim saat tab ditutup.
       fetch(`${API_BASE}/api/rooms/${encodeURIComponent(code)}/leave`, {
@@ -304,17 +392,18 @@ export class RoomSession {
 
   /** Berhenti tanpa memberi tahu server (dipakai saat fatal). */
   stop(): void {
-    this.stopInternal(false);
+    this.stopInternal();
   }
 
-  private stopInternal(_sendLeave: boolean): void {
+  private stopInternal(): void {
     this.stopped = true;
     this.abort?.abort();
     this.abort = null;
     if (this.heartbeatTimer !== null) window.clearInterval(this.heartbeatTimer);
-    if (this.reconnectTimer !== null) window.clearTimeout(this.reconnectTimer);
+    if (this.watchdogTimer !== null) window.clearInterval(this.watchdogTimer);
     this.heartbeatTimer = null;
-    this.reconnectTimer = null;
+    this.watchdogTimer = null;
+    this.detachVisibility();
   }
 }
 

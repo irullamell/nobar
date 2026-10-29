@@ -13,8 +13,12 @@ export const ROOM_TTL_SECONDS = 24 * 60 * 60;
 /** Interval heartbeat presence klien (ms). */
 export const HEARTBEAT_INTERVAL_MS = 15_000;
 
-/** Peer dianggap offline jika tidak heartbeat selama ini (ms). */
-export const PRESENCE_TIMEOUT_MS = 45_000;
+/**
+ * Peer dianggap offline jika tidak ter-refresh selama ini (ms).
+ * Sengaja longgar (120 detik): browser men-throttle timer di tab background
+ * (bisa jadi ±1x/menit), dan loop SSE server juga ikut me-refresh lastSeen.
+ */
+export const PRESENCE_TIMEOUT_MS = 120_000;
 
 /** Alur sinyal SSE: server menutup stream setelah ini (ms), klien reconnect. */
 export const SSE_MAX_DURATION_MS = 50_000;
