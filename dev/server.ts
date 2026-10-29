@@ -6,6 +6,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
 import roomsIndex from "../api/rooms/index.js";
+import health from "../api/health.js";
 import roomInfo from "../api/rooms/[code]/index.js";
 import join from "../api/rooms/[code]/join.js";
 import heartbeat from "../api/rooms/[code]/heartbeat.js";
@@ -28,7 +29,9 @@ const server = createServer(async (req, res) => {
   (req as IncomingMessage & { query?: Record<string, string> }).query = query;
 
   let handler: Handler | null = null;
-  if (parts[0] === "api" && parts[1] === "rooms") {
+  if (parts[0] === "api" && parts[1] === "health" && parts.length === 2) {
+    handler = health;
+  } else if (parts[0] === "api" && parts[1] === "rooms") {
     if (parts.length === 2) handler = roomsIndex;
     else if (parts.length === 3) {
       query.code = parts[2];

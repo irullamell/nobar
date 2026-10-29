@@ -225,6 +225,50 @@ class MemoryStore implements Store {
 
 // ------------------------- Singleton -------------------------
 
+/** Dilempar bila produksi berjalan tanpa konfigurasi Redis. */
+export class StorageNotConfiguredError extends Error {
+  constructor() {
+    super(
+      "Penyimpanan Redis belum dikonfigurasi di server. Tambahkan UPSTASH_REDIS_REST_URL dan UPSTASH_REDIS_REST_TOKEN di Vercel (Settings → Environment Variables), lalu deploy ulang.",
+    );
+    this.name = "StorageNotConfiguredError";
+  }
+}
+
+/** Store yang selalu gagal - dipakai di produksi tanpa env Redis agar errornya jelas. */
+class NullStore implements Store {
+  private fail(): never {
+    throw new StorageNotConfiguredError();
+  }
+  hset(): Promise<void> { this.fail(); }
+  hget(): Promise<string | null> { this.fail(); }
+  hgetall(): Promise<Record<string, string>> { this.fail(); }
+  hdel(): Promise<void> { this.fail(); }
+  set(): Promise<void> { this.fail(); }
+  get(): Promise<string | null> { this.fail(); }
+  del(): Promise<void> { this.fail(); }
+  sadd(): Promise<void> { this.fail(); }
+  srem(): Promise<void> { this.fail(); }
+  smembers(): Promise<string[]> { this.fail(); }
+  sismember(): Promise<boolean> { this.fail(); }
+  incr(): Promise<number> { this.fail(); }
+  expire(): Promise<void> { this.fail(); }
+  xadd(): Promise<string> { this.fail(); }
+  xrangeAfter(): Promise<StreamEntry[]> { this.fail(); }
+}
+
+export type StorageMode = "redis" | "memory" | "missing";
+
+function isProductionRuntime(): boolean {
+  return process.env.VERCEL === "1" || process.env.NODE_ENV === "production";
+}
+
+/** Mode penyimpanan aktif - dipakai endpoint /api/health untuk diagnosis. */
+export function getStorageMode(): StorageMode {
+  if (env("UPSTASH_REDIS_REST_URL") && env("UPSTASH_REDIS_REST_TOKEN")) return "redis";
+  return isProductionRuntime() ? "missing" : "memory";
+}
+
 let store: Store | null = null;
 
 export function getStore(): Store {
@@ -234,6 +278,11 @@ export function getStore(): Store {
   if (url && token) {
     store = new UpstashStore(new Redis({ url, token }));
     console.log("[store] memakai Upstash Redis");
+  } else if (isProductionRuntime()) {
+    // Produksi tanpa Redis = pasti rusak (serverless tidak berbagi memori).
+    // Gagal secara eksplisit supaya penyebabnya langsung terlihat.
+    store = new NullStore();
+    console.error("[store] PRODUKSI tanpa UPSTASH_REDIS_REST_URL/TOKEN - semua request akan dibalas 503 STORAGE_NOT_CONFIGURED");
   } else {
     store = new MemoryStore();
     console.warn("[store] UPSTASH_REDIS_REST_URL/TOKEN tidak ada - memakai penyimpanan in-memory (khusus dev, data hilang saat restart)");

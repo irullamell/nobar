@@ -142,6 +142,16 @@ npm run test:api
 - **Uplink host** menentukan kualitas: 20 penonton berarti layar dikirim 20 kali dari koneksi host. Untuk kelompok besar, kurangi maks penonton atau self-host Piik asli yang punya SFU.
 - SSE function dibatasi `maxDuration` (diset 60 detik; di paket Hobby dengan Fluid Compute bisa lebih). Klien reconnect otomatis, jadi ini transparan.
 
+## Solusi Masalah
+
+| Gejala | Penyebab | Solusi |
+| --- | --- | --- |
+| **"Room berakhir / ROOM_NOT_FOUND"** terus-menerus di Vercel | `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` belum diset — atau diset **setelah** deploy sehingga belum aktif | Buka beranda situs Anda: akan muncul banner merah **"Server belum dikonfigurasi"**. Tambahkan kedua env var di Vercel → *Settings → Environment Variables* (Redis gratis: *Marketplace → Upstash Redis*), lalu **deploy ulang**. API akan membalas `503 STORAGE_NOT_CONFIGURED` dengan instruksi yang sama |
+| Cek cepat konfigurasi server | — | Buka `https://situs-anda/api/health` → field `storage` harus `"redis"`. `"missing"` = env belum terpasang; `"memory"` = mode dev |
+| Room hilang semua (dev lokal) | Penyimpanan in-memory | Normal untuk dev — restart `npm run dev:api` mengosongkan semua room |
+| Room hilang setelah ±24 jam | TTL otomatis | By design — buat room baru |
+| Gambar tidak muncul di penonton | Host belum berbagi, atau P2P gagal di NAT ketat | Pastikan host menekan **Mulai Berbagi**; untuk jaringan restriktif tambahkan TURN di `shared/protocol.ts` → `ICE_SERVERS` |
+
 ## Ingin fitur Piik lengkap (SFU, remote control, room voice)?
 
 Gunakan [Piik asli](https://github.com/TNTcraftHIM/Piik) dan self-host server Go-nya

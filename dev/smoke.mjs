@@ -59,6 +59,11 @@ function openSSE(code, peerId, token, cursor, onEvent) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function main() {
+  console.log("0) Health check");
+  const health = await api("/api/health");
+  check("health 200", health.status === 200, JSON.stringify(health.json));
+  check("storage terdeteksi (dev: memory)", ["redis", "memory"].includes(health.json?.storage), JSON.stringify(health.json));
+
   console.log("1) Buat room dengan password");
   const created = await api("/api/rooms", {
     name: "Nonton Bareng",

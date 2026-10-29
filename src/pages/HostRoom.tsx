@@ -31,7 +31,7 @@ export function HostRoom({ code, hostToken, hostName, onExit }: HostRoomProps) {
   const [sharing, setSharing] = useState(false);
   const [busy, setBusy] = useState(false);
   const [connStates, setConnStates] = useState<Record<string, PeerConnState>>({});
-  const [fatal, setFatal] = useState<{ reason: SessionFatalReason; message: string } | null>(null);
+  const [fatal, setFatal] = useState<{ reason: SessionFatalReason; message: string; title?: string } | null>(null);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [floaters, setFloaters] = useState<Floater[]>([]);
@@ -175,7 +175,14 @@ export function HostRoom({ code, hostToken, hostName, onExit }: HostRoomProps) {
     sessionRef.current = session;
     broadcasterRef.current = broadcaster;
     session.start().catch((e: unknown) => {
-      setFatal({ reason: "session-lost", message: e instanceof ApiError ? e.message : "Gagal masuk room." });
+      const apiCode = e instanceof ApiError ? e.code : "";
+      const title =
+        apiCode === "ROOM_NOT_FOUND"
+          ? "Room tidak ditemukan"
+          : apiCode === "STORAGE_NOT_CONFIGURED"
+            ? "Server belum dikonfigurasi"
+            : undefined;
+      setFatal({ reason: "session-lost", message: e instanceof ApiError ? e.message : "Gagal masuk room.", title });
     });
 
     const onUnload = () => session.leave();
@@ -323,7 +330,7 @@ export function HostRoom({ code, hostToken, hostName, onExit }: HostRoomProps) {
       <div className="app">
         <div className="join-center">
           <div className="card join-card" style={{ textAlign: "center" }}>
-            <h3>Room berakhir</h3>
+            <h3>{fatal.title ?? "Room berakhir"}</h3>
             <p className="muted">{fatal.message}</p>
             <button className="btn btn-primary mt" onClick={() => navigate("/")}>Kembali ke Beranda</button>
           </div>

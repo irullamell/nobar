@@ -4,11 +4,24 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { streamEvents } from "../../_lib/rooms.js";
 import { queryParam, routeParam } from "../../_lib/route.js";
+import { getStorageMode } from "../../_lib/store.js";
 import { SSE_MAX_DURATION_MS } from "../../../shared/protocol.js";
 
 export const maxDuration = 60; // detik; didukung Fluid Compute (Hobby: default 300)
 
 export default async function handler(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  // Produksi tanpa Redis: balas JSON 503 yang jelas (sebelum header SSE dikirim).
+  if (getStorageMode() === "missing") {
+    res.writeHead(503, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        error: "STORAGE_NOT_CONFIGURED",
+        message: "Tambahkan UPSTASH_REDIS_REST_URL dan UPSTASH_REDIS_REST_TOKEN di Vercel, lalu deploy ulang.",
+      }),
+    );
+    return;
+  }
+
   const code = routeParam(req, "code");
   const peerId = queryParam(req, "peerId");
   const cursor = queryParam(req, "cursor");

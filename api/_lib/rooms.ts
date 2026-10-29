@@ -28,6 +28,13 @@ import {
 
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // tanpa 0/O/1/I
 
+const ROOM_NOT_FOUND_MESSAGE =
+  "Room tidak ditemukan atau sudah ditutup/kedaluwarsa (room otomatis dihapus setelah 24 jam tanpa aktivitas). Periksa lagi kode/tautan undangannya, atau buat room baru.";
+
+function roomNotFound(): JsonResult {
+  return err(404, "ROOM_NOT_FOUND", ROOM_NOT_FOUND_MESSAGE);
+}
+
 // ------------------------- keys -------------------------
 
 const kRoom = (code: string) => `piik:room:${code}`;
@@ -260,10 +267,10 @@ export async function createRoom(input: { ip: string; [key: string]: unknown }):
 
 export async function getRoomInfo(codeRaw: string, ip: string): Promise<JsonResult> {
   const code = normalizeRoomCode(codeRaw);
-  if (code.length !== ROOM_CODE_LENGTH) return err(404, "ROOM_NOT_FOUND");
+  if (code.length !== ROOM_CODE_LENGTH) return roomNotFound();
   if (!(await rateLimit("info", `${ip}:${code}`, 60, 60))) return err(429, "RATE_LIMITED");
   const meta = await loadRoom(code);
-  if (!meta || meta.closed) return err(404, "ROOM_NOT_FOUND");
+  if (!meta || meta.closed) return roomNotFound();
   const peers = await loadPeers(code);
   return ok({ room: roomInfoOf(meta, peers, code) });
 }
@@ -275,13 +282,13 @@ export async function joinRoom(
   input: { ip: string; [key: string]: unknown },
 ): Promise<JsonResult> {
   const code = normalizeRoomCode(codeRaw);
-  if (code.length !== ROOM_CODE_LENGTH) return err(404, "ROOM_NOT_FOUND");
+  if (code.length !== ROOM_CODE_LENGTH) return roomNotFound();
   if (!(await rateLimit("join", `${ip2Key(input.ip)}:${code}`, 30, 60))) {
     return err(429, "RATE_LIMITED", "Terlalu banyak percobaan bergabung. Tunggu sebentar.");
   }
 
   const meta = await loadRoom(code);
-  if (!meta || meta.closed) return err(404, "ROOM_NOT_FOUND");
+  if (!meta || meta.closed) return roomNotFound();
 
   const name = str(input.name, 40);
   const clientId = str(input.clientId, 64);
@@ -388,7 +395,7 @@ export async function heartbeatRoom(
   const peer = await verifyPeer(code, input.peerId, input.token);
   if (!peer) return err(401, "SESSION_EXPIRED");
   const meta = await loadRoom(code);
-  if (!meta || meta.closed) return err(404, "ROOM_NOT_FOUND");
+  if (!meta || meta.closed) return roomNotFound();
   const peers = await loadPeers(code); // sekaligus prune yang timeout
   await touchRoom(code);
   return ok({ ok: true, room: roomInfoOf(meta, peers, code), peers: peers.map(publicPeer) });
@@ -477,7 +484,7 @@ export async function hostAction(
 ): Promise<JsonResult> {
   const code = normalizeRoomCode(codeRaw);
   const meta = await loadRoom(code);
-  if (!meta || meta.closed) return err(404, "ROOM_NOT_FOUND");
+  if (!meta || meta.closed) return roomNotFound();
   if (typeof input.hostToken !== "string" || !safeEqual(sha256(input.hostToken), meta.hostTokenHash)) {
     return err(403, "INVALID_TOKEN", "Token host tidak valid.");
   }

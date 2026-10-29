@@ -62,6 +62,17 @@ export function apiListPublicRooms(): Promise<{ rooms: RoomInfo[] }> {
   });
 }
 
+export interface HealthInfo {
+  ok: boolean;
+  storage: "redis" | "memory" | "missing";
+  production: boolean;
+  hint?: string;
+}
+
+export function apiHealth(): Promise<HealthInfo> {
+  return request<HealthInfo>("/api/health", { cache: "no-store" });
+}
+
 export function apiRoomInfo(code: string): Promise<{ room: RoomInfo }> {
   return request<{ room: RoomInfo }>(`/api/rooms/${encodeURIComponent(code)}`);
 }

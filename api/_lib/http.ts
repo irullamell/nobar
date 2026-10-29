@@ -1,10 +1,26 @@
 // Helper HTTP kecil untuk serverless functions (node req/res style).
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createHash, timingSafeEqual } from "node:crypto";
+import { StorageNotConfiguredError } from "./store.js";
 
 export interface JsonResult {
   status: number;
   body: unknown;
+}
+
+/**
+ * Bungkus hasil logika: ubah StorageNotConfiguredError menjadi 503 yang jelas
+ * sehingga deploy tanpa Redis tidak terlihat seperti "room misterius hilang".
+ */
+export async function result(promise: Promise<JsonResult>): Promise<JsonResult> {
+  try {
+    return await promise;
+  } catch (e) {
+    if (e instanceof StorageNotConfiguredError) {
+      return err(503, "STORAGE_NOT_CONFIGURED", e.message);
+    }
+    throw e;
+  }
 }
 
 export function ok(body: unknown): JsonResult {

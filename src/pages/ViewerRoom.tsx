@@ -31,7 +31,7 @@ export function ViewerRoom({ code, onExit }: ViewerRoomProps) {
   const [status, setStatus] = useState<"connecting" | "live" | "reconnecting">("connecting");
   const [viewerStatus, setViewerStatus] = useState<ViewerStatus>("waiting-host");
   const [chat, setChat] = useState<ChatMessage[]>([]);
-  const [fatal, setFatal] = useState<{ reason: SessionFatalReason; message: string } | null>(null);
+  const [fatal, setFatal] = useState<{ reason: SessionFatalReason; message: string; title?: string } | null>(null);
   const [floaters, setFloaters] = useState<Floater[]>([]);
 
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -68,7 +68,14 @@ export function ViewerRoom({ code, onExit }: ViewerRoomProps) {
         if (e instanceof ApiError && e.code === "BANNED") {
           setFatal({ reason: "banned", message: e.message });
         } else {
-          setFatal({ reason: "closed", message: e instanceof ApiError ? e.message : "Room tidak ditemukan." });
+          const apiCode = e instanceof ApiError ? e.code : "";
+          const title =
+            apiCode === "ROOM_NOT_FOUND"
+              ? "Room tidak ditemukan"
+              : apiCode === "STORAGE_NOT_CONFIGURED"
+                ? "Server belum dikonfigurasi"
+                : undefined;
+          setFatal({ reason: "closed", message: e instanceof ApiError ? e.message : "Room tidak ditemukan.", title });
         }
         setPhase("fatal");
       });
@@ -218,11 +225,14 @@ export function ViewerRoom({ code, onExit }: ViewerRoomProps) {
 
   if (phase === "fatal" && fatal) {
     const icon = fatal.reason === "banned" ? "🚫" : fatal.reason === "kicked" ? "👋" : "🔒";
+    const title =
+      fatal.title ??
+      (fatal.reason === "banned" ? "Anda di-ban" : fatal.reason === "kicked" ? "Anda dikeluarkan" : "Room berakhir");
     return (
       <div className="app">
         <div className="join-center">
           <div className="card join-card" style={{ textAlign: "center" }}>
-            <h3>{icon} {fatal.reason === "banned" ? "Anda di-ban" : fatal.reason === "kicked" ? "Anda dikeluarkan" : "Room berakhir"}</h3>
+            <h3>{icon} {title}</h3>
             <p className="muted">{fatal.message}</p>
             <button className="btn btn-primary mt" onClick={() => (fatal.reason === "kicked" ? window.location.reload() : onExit())}>
               {fatal.reason === "kicked" ? "Muat Ulang" : "Kembali ke Beranda"}

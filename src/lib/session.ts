@@ -116,7 +116,7 @@ export class RoomSession {
         // Sesi hilang di server: coba masuk ulang dengan kredensial yang sama.
         if (await this.rejoin()) this.setStatus("live");
       } else if (error instanceof ApiError && error.status === 404) {
-        this.fatal("closed", "Room ditutup oleh host.");
+        this.fatal("closed", error.message || "Room ditutup atau sudah kedaluwarsa.");
       }
       // Error jaringan sesaat diabaikan; percobaan berikutnya menyusul.
     }
@@ -142,7 +142,7 @@ export class RoomSession {
         if (error instanceof ApiError && error.status === 401) {
           if (!(await this.rejoin())) return;
         } else if (error instanceof ApiError && error.status === 404) {
-          this.fatal("closed", "Room ditutup oleh host.");
+          this.fatal("closed", error.message || "Room ditutup atau sudah kedaluwarsa.");
           return;
         }
       }

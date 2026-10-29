@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { ApiError, apiCreateRoom, apiListPublicRooms } from "../lib/api";
+import { ApiError, apiCreateRoom, apiHealth, apiListPublicRooms, type HealthInfo } from "../lib/api";
 import { getClientId } from "../lib/clientid";
 import { loadDisplayName, navigate, saveDisplayName, saveHostCredentials } from "../lib/navigation";
 import {
@@ -24,6 +24,21 @@ export function Home({ onNavigate }: HomeProps) {
   const [joinCode, setJoinCode] = useState("");
   const [busy, setBusy] = useState<"create" | "join" | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [health, setHealth] = useState<HealthInfo | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    apiHealth()
+      .then((h) => {
+        if (!cancelled) setHealth(h);
+      })
+      .catch(() => {
+        if (!cancelled) setHealth({ ok: false, storage: "missing", production: true });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   async function create(event: FormEvent): Promise<void> {
     event.preventDefault();
@@ -85,6 +100,21 @@ export function Home({ onNavigate }: HomeProps) {
             undangan (dan password bila Anda aktifkan). Sebagai host, Anda bisa <strong>kick</strong> dan <strong>ban</strong> penonton.
           </p>
         </div>
+
+        {health?.storage === "missing" && (
+          <div className="error-box" style={{ marginBottom: 16 }}>
+            ⚠️ <strong>Server belum dikonfigurasi.</strong> Redis tidak ditemukan, sehingga room akan
+            selalu gagal (ROOM_NOT_FOUND). Tambahkan <span className="mono">UPSTASH_REDIS_REST_URL</span> dan{" "}
+            <span className="mono">UPSTASH_REDIS_REST_TOKEN</span> di Vercel → <em>Settings → Environment
+            Variables</em> (buat Redis gratis via Marketplace “Upstash Redis”), lalu <strong>deploy ulang</strong>.
+          </div>
+        )}
+        {health?.storage === "memory" && (
+          <div className="notice-box" style={{ marginBottom: 16 }}>
+            🛠 Mode pengembangan: penyimpanan in-memory — semua room <strong>hilang saat server di-restart</strong>.
+            Untuk produksi, pasang Redis (lihat README).
+          </div>
+        )}
 
         {error && <div className="error-box">{error}</div>}
 
