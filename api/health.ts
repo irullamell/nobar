@@ -12,6 +12,9 @@ export default function handler(req: IncomingMessage, res: ServerResponse): void
     ok({
       ok: storage !== "missing",
       storage,
+      // Nonce dev: memungkinkan test memastikan server yang menjawab adalah
+      // anak yang baru dispawn (bukan zombie dari run sebelumnya).
+      ...(process.env.PIIK_DEV_RUN_ID ? { runId: process.env.PIIK_DEV_RUN_ID } : {}),
       production: process.env.VERCEL === "1" || process.env.NODE_ENV === "production",
       hint:
         storage === "missing"

@@ -162,36 +162,37 @@ async function publish(code: string, event: Record<string, unknown>, to?: string
 
 async function verifyPeer(code: string, peerId: unknown, token: unknown): Promise<PeerRecord | null> {
   if (typeof peerId !== "string" || typeof token !== "string") return null;
+  // PENTING: error store (Upstash kuota/rate-limit) HARUS menyebar sebagai
+  // throw - jangan disamakan dengan "sesi tidak valid" (null). Null memicu
+  // 401/SESSION_EXPIRED yang membuat klien rejoin penuh (peerId berganti,
+  // video terputus) padahal sesinya sehat; throw hanya membuat pemanggil
+  // (loop SSE / heartbeat) mencoba lagi nanti.
   const raw = await getStore().hget(kPeers(code), peerId);
   if (!raw) return null;
+  let p: PeerRecord;
   try {
-    const p = JSON.parse(raw) as PeerRecord;
-    if (!safeEqual(p.tokenHash, sha256(token))) return null;
-    p.lastSeen = Date.now();
-    await getStore().hset(kPeers(code), { [peerId]: JSON.stringify(p) });
-    return p;
+    p = JSON.parse(raw) as PeerRecord;
   } catch {
-    return null;
+    return null; // record rusak → anggap tidak valid
   }
+  if (!safeEqual(p.tokenHash, sha256(token))) return null;
+  p.lastSeen = Date.now();
+  await getStore().hset(kPeers(code), { [peerId]: JSON.stringify(p) });
+  return p;
 }
 
+const kTouch = (code: string) => `piik:touch:${code}`;
+
 /**
- * Refresh lastSeen peer TANPA validasi token - dipanggil dari loop SSE.
- * Inilah kunci presence yang andal: koneksi SSE adalah kanal jaringan yang
- * tidak di-throttle browser (berbeda dengan setInterval di tab background),
- * jadi selama stream hidup, peer dianggap online.
+ * Perpanjang TTL semua key room, maksimal 1x per 5 menit per room.
+ * (touchRoom langsung = 5 perintah expire; dipanggil tiap heartbeat 15 detik
+ * akan boros kuota Upstash - free tier hanya 10 ribu perintah/hari.)
  */
-async function refreshPeer(code: string, peerId: string): Promise<void> {
+async function touchRoomThrottled(code: string): Promise<void> {
   const store = getStore();
-  const raw = await store.hget(kPeers(code), peerId);
-  if (!raw) return;
-  try {
-    const p = JSON.parse(raw) as PeerRecord;
-    p.lastSeen = Date.now();
-    await store.hset(kPeers(code), { [peerId]: JSON.stringify(p) });
-  } catch {
-    /* record rusak; biarkan di-prune */
-  }
+  if (await store.get(kTouch(code))) return;
+  await touchRoom(code);
+  await store.set(kTouch(code), String(Date.now()), 300);
 }
 
 // ------------------------- create -------------------------
@@ -370,7 +371,7 @@ export async function joinRoom(
   await store.hset(kPeers(code), { [peerId]: JSON.stringify(record) });
 
   await publish(code, { type: "peer-joined", peer: publicPeer(record) });
-  await touchRoom(code);
+  await touchRoomThrottled(code);
 
   peers = await loadPeers(code);
 
@@ -416,7 +417,7 @@ export async function heartbeatRoom(
   const meta = await loadRoom(code);
   if (!meta || meta.closed) return roomNotFound();
   const peers = await loadPeers(code); // sekaligus prune yang timeout
-  await touchRoom(code);
+  await touchRoomThrottled(code); // hemat kuota: full touch maksimal 1x/5 menit
   return ok({ ok: true, room: roomInfoOf(meta, peers, code), peers: peers.map(publicPeer) });
 }
 
@@ -528,6 +529,9 @@ export async function hostAction(
     if (target) {
       await store.hdel(kPeers(code), peerId);
       await store.set(kGone(code, peerId), action === "ban" ? "banned" : "kicked", 120);
+      // Kirim you-removed TERARAH seketika ke stream korban - jangan andalkan
+      // cek berkala loop SSE (5 detik) agar kick/ban terasa instan.
+      await publish(code, { type: "you-removed", reason: action === "ban" ? "banned" : "kicked" }, peerId);
       await publish(code, { type: "peer-left", peerId, reason: action === "ban" ? "banned" : "kicked" });
     }
     const peers = await loadPeers(code);
@@ -687,8 +691,18 @@ export async function streamEvents(
   const code = normalizeRoomCode(codeRaw);
   const store = getStore();
 
-  const peer = await verifyPeer(code, input.peerId, input.token);
-  if (!peer) {
+  // Verifikasi awal. Bila store sedang error (mis. kuota/rate-limit Upstash),
+  // JANGAN matikan stream: masuk loop tanpa verifikasi dan terus coba ulang -
+  // ping menjaga koneksi tetap hidup tanpa menyentuh Redis sama sekali.
+  let peer: PeerRecord | null = null;
+  let sessionInvalid = false;
+  try {
+    peer = await verifyPeer(code, input.peerId, input.token);
+    sessionInvalid = !peer;
+  } catch {
+    /* store error: verifikasi diulang di dalam loop */
+  }
+  if (sessionInvalid) {
     handlers.emit("0", "error", { error: "SESSION_EXPIRED" });
     return;
   }
@@ -696,55 +710,105 @@ export async function streamEvents(
   const started = Date.now();
   let cursor = input.cursor;
   let lastPing = Date.now();
-  let lastPrune = 0;
+  let lastCheck = 0;
+  let lastTouch = 0;
+  let lastEntryAt = Date.now();
+  let consecutiveErrors = 0;
+
+  // Anggaran Redis sangat penting: Upstash free = 10 ribu perintah/HARI.
+  // Loop lama memakai ~4 panggilan/detik/klien (kuota habis < 1 jam!).
+  // Sekarang: 1 poll/detik (2 detik saat room sunyi) + cek berkala tiap 5 detik.
+  const POLL_ACTIVE_MS = 1_000;
+  const POLL_IDLE_MS = 2_000;
+  const IDLE_AFTER_MS = 30_000;
+  const CHECK_INTERVAL_MS = 5_000;
+  const TOUCH_INTERVAL_MS = 60_000;
+  const MAX_CONSECUTIVE_ERRORS = 60; // store mati total ±1-2 menit → akhiri senyap
 
   while (!handlers.isClosed()) {
-    if (Date.now() - started > input.maxMs) break;
+    const now = Date.now();
+    if (now - started > input.maxMs) break;
 
-    const entries = await store.xrangeAfter(kEvents(code), cursor, 100);
-    for (const entry of entries) {
-      cursor = entry.id;
-      const to = entry.fields.to;
-      if (to && to !== peer.peerId) continue; // bukan untuk koneksi ini
-      try {
-        const payload = JSON.parse(entry.fields.payload) as Record<string, unknown>;
-        handlers.emit(entry.id, String(payload.type ?? entry.fields.type), payload);
-      } catch {
-        /* lewati event rusak */
+    try {
+      if (!peer) {
+        // Store sempat error saat verifikasi awal - coba lagi.
+        peer = await verifyPeer(code, input.peerId, input.token);
+        if (!peer) {
+          // Store sehat tapi record sesi hilang (di-prune/kick).
+          handlers.emit("0", "error", { error: "SESSION_EXPIRED" });
+          break;
+        }
+      }
+      const self = peer;
+
+      // 1) Poll event - satu-satunya panggilan Redis per tick.
+      const entries = await store.xrangeAfter(kEvents(code), cursor, 100);
+      for (const entry of entries) {
+        cursor = entry.id;
+        const to = entry.fields.to;
+        if (to && to !== self.peerId) continue; // bukan untuk koneksi ini
+        try {
+          const payload = JSON.parse(entry.fields.payload) as Record<string, unknown>;
+          handlers.emit(entry.id, String(payload.type ?? entry.fields.type), payload);
+        } catch {
+          /* lewati event rusak */
+        }
+      }
+      if (entries.length > 0) lastEntryAt = now;
+
+      // 2) Cek berkala (tiap 5 detik): prune peer mati + keanggotaan + status
+      //    room, sekaligus refresh presence sendiri (1 hset). Kick/ban tetap
+      //    tiba instan lewat event terarah; cek ini hanya jaring pengaman.
+      if (now - lastCheck > CHECK_INTERVAL_MS) {
+        lastCheck = now;
+        const [peers, roomHash] = await Promise.all([
+          loadPeers(code),
+          store.hgetall(kRoom(code)),
+        ]);
+        const me = peers.find((p) => p.peerId === self.peerId);
+        if (!me) {
+          const reason = (await store.get(kGone(code, self.peerId))) ?? "timeout";
+          handlers.emit("0", "you-removed", { reason });
+          break;
+        }
+        // Refresh presence: kanal SSE tidak di-throttle browser, jadi selama
+        // stream ini hidup peer dianggap online (kunci presence andal).
+        me.lastSeen = Date.now();
+        await store.hset(kPeers(code), { [self.peerId]: JSON.stringify(me) });
+        if (!roomHash.name) {
+          handlers.emit("0", "you-removed", { reason: "closed" });
+          break;
+        }
+        if (roomHash.closed === "1") break; // event room-closed sudah terkirim lewat stream
+      }
+
+      // 3) Perpanjang TTL room (throttle: maksimal 1x per 5 menit per room).
+      if (now - lastTouch > TOUCH_INTERVAL_MS) {
+        lastTouch = now;
+        await touchRoomThrottled(code);
+      }
+
+      consecutiveErrors = 0;
+    } catch {
+      // Error Upstash (kuota habis, 429, timeout, dsb.): JANGAN crash-kan
+      // stream. Koneksi tetap hidup lewat ping; begitu store pulih, event
+      // mengalir lagi otomatis. Stream yang mati <3 detik inilah yang dulu
+      // membuat badge berkedip "Menyambung ulang" di Vercel.
+      consecutiveErrors++;
+      if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+        handlers.emit("0", "error", { error: "STORE_UNAVAILABLE" });
+        break; // akhiri senyap; klien reconnect dengan backoff
       }
     }
 
-    // Prune peer mati + refresh presence sendiri, maksimal tiap 10 detik.
-    const now = Date.now();
-    if (now - lastPrune > 10_000) {
-      lastPrune = now;
-      await refreshPeer(code, peer.peerId);
-      await loadPeers(code);
-    }
-
-    // Masih jadi anggota room?
-    const stillMember = await store.hget(kPeers(code), peer.peerId);
-    if (!stillMember) {
-      const reason = (await store.get(kGone(code, peer.peerId))) ?? "timeout";
-      handlers.emit("0", "you-removed", { reason });
-      break;
-    }
-
-    // Room ditutup?
-    const roomExists = await store.hget(kRoom(code), "name");
-    if (!roomExists) {
-      handlers.emit("0", "you-removed", { reason: "closed" });
-      break;
-    }
-    const closed = await store.hget(kRoom(code), "closed");
-    if (closed === "1") break; // event room-closed sudah terkirim lewat stream
-
-    if (now - lastPing > 15_000) {
-      lastPing = now;
+    // Ping tidak menyentuh Redis - stream tetap hidup saat store mati.
+    const nowPing = Date.now();
+    if (nowPing - lastPing > 15_000) {
+      lastPing = nowPing;
       handlers.comment("ping");
     }
 
-    await sleep(1000);
+    await sleep(nowPing - lastEntryAt > IDLE_AFTER_MS ? POLL_IDLE_MS : POLL_ACTIVE_MS);
   }
 }
 

@@ -343,6 +343,27 @@ export function getStorageMode(): StorageMode {
 
 let store: Store | null = null;
 
+/**
+ * Pembungkus uji (KHUSUS dev/test): membuat store gagal secara acak dengan
+ * probabilitas PIIK_DEV_STORE_FAIL_RATE untuk mensimulasikan error/limit
+ * Upstash di produksi. Stream SSE dan klien harus tetap tenang (tidak flip
+ * "Menyambung ulang") walau store sering error.
+ */
+function injectFailures(inner: Store, rate: number): Store {
+  return new Proxy(inner, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver);
+      if (typeof value !== "function" || prop === "constructor") return value;
+      return (...args: unknown[]) => {
+        if (Math.random() < rate) {
+          return Promise.reject(new Error("PIIK_DEV: kegagalan store terinjeksi"));
+        }
+        return (value as (...a: unknown[]) => unknown).apply(target, args);
+      };
+    },
+  });
+}
+
 export function getStore(): Store {
   if (store) return store;
   const url = env("UPSTASH_REDIS_REST_URL");
@@ -358,6 +379,11 @@ export function getStore(): Store {
   } else {
     store = new MemoryStore();
     console.warn("[store] UPSTASH_REDIS_REST_URL/TOKEN tidak ada - memakai penyimpanan in-memory (khusus dev, data hilang saat restart)");
+    const failRate = Number(process.env.PIIK_DEV_STORE_FAIL_RATE ?? "0");
+    if (failRate > 0) {
+      store = injectFailures(store, Math.min(failRate, 1));
+      console.warn(`[store] injeksi kegagalan store aktif: ${(Math.min(failRate, 1) * 100).toFixed(0)}% (mode uji)`);
+    }
   }
   return store;
 }

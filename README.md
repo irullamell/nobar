@@ -133,7 +133,7 @@ npm run test:api
 | Penyadapan sinyal antar viewer | Pesan `signal` tertarget — server hanya mengirim ke peer tujuan |
 | Brute force | Rate limit per IP: create 20/jam, join 30/menit, info 60/menit, pesan 600/menit |
 | Secret bocor via timing attack | Perbandingan token/password memakai `timingSafeEqual` |
-| Room zombie | Semua key Redis ber-TTL 24 jam; presence di-prune otomatis (45 detik) |
+| Room zombie | Semua key Redis ber-TTL 24 jam; presence di-prune otomatis (120 detik, di-refresh oleh heartbeat DAN koneksi SSE) |
 
 **Batasan yang perlu diketahui (jujur):**
 
@@ -151,6 +151,22 @@ npm run test:api
 | Room hilang semua (dev lokal) | Penyimpanan in-memory | Normal untuk dev — restart `npm run dev:api` mengosongkan semua room |
 | Room hilang setelah ±24 jam | TTL otomatis | By design — buat room baru |
 | Gambar tidak muncul di penonton | Host belum berbagi, atau P2P gagal di NAT ketat | Pastikan host menekan **Mulai Berbagi**; untuk jaringan restriktif tambahkan TURN di `shared/protocol.ts` → `ICE_SERVERS` |
+| Badge sering berubah **"Menyambung ulang"** di Vercel / peserta terlihat **offline** | **Kuota Upstash free tier habis** (10 ribu perintah/hari) atau kena rate-limit — semua perintah Redis mulai ditolak | Buka [Upstash Console](https://console.upstash.com) → database Anda → tab **Usage/Daily Usage**. Bila limit tercapai: aktifkan **Pay-as-you-go** (Billing → upgrade; ±$0,20 per 100 ribu perintah ≈ beberapa ratus rupiah per sesi nobar) ATAU tunggu reset kuota tengah malam UTC. Kode server sudah dibuat tahan: stream SSE tetap hidup (ping) saat Redis error dan pemakaian Redis sudah ditekan ±4x |
+| Chat/reaksi tidak terkirim sesekali | Gangguan sesaat Upstash (latensi/limit) | Klien mengirim ulang otomatis; bila terus-menerus, lihat baris kuota di atas |
+
+## Kuota Upstash (penting untuk produksi)
+
+Setiap klien yang berada di dalam room memakai perintah Redis secara kontinu
+(poll event ±1/detik saat aktif, ±1/2 detik saat sunyi, cek presence tiap 5 detik,
+heartbeat tiap 15 detik). Perkiraan: **±3–6 ribu perintah/jam per klien**.
+
+- **Free tier (10 ribu perintah/HARI)**: cukup untuk uji coba singkat — sekitar
+  1–2 jam total pemakaian room per hari. Setelah habis, SEMUA operasi gagal
+  sampai reset tengah malam UTC (gejala: badge "Menyambung ulang", presence
+  offline, chat gagal).
+- **Pay-as-you-go ($0,20 / 100 ribu perintah)**: disarankan untuk pemakaian
+  nyata. Sesi nobar 3 jam dengan 5 orang ≈ 60–90 ribu perintah ≈ **$0,15**
+  (±Rp2.500). Aktifkan lewat Upstash Console → database → **Billing/Upgrade**.
 
 ## Ingin fitur Piik lengkap (SFU, remote control, room voice)?
 
