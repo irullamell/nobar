@@ -11,5 +11,6 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["api", "shared", "dev"]
+  "include": ["api", "shared", "dev"],
+  "exclude": ["dev/test-session.ts"]
 }

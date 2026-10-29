@@ -1,6 +1,10 @@
 // Klien HTTP untuk serverless API Piik Lite.
 import type { CreateRoomResponse, JoinResponse, PeerInfo, RoomInfo } from "../../shared/protocol";
 
+/** Basis URL API: origin yang sama di browser; bisa di-override untuk pengujian di Node. */
+export const API_BASE: string =
+  typeof location !== "undefined" && location.origin ? location.origin : "";
+
 export class ApiError extends Error {
   constructor(
     readonly code: string,
@@ -15,7 +19,7 @@ export class ApiError extends Error {
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(url, init);
+    response = await fetch(API_BASE + url, init);
   } catch {
     throw new ApiError("NETWORK", "Tidak dapat menghubungi server. Periksa koneksi Anda.", 0);
   }

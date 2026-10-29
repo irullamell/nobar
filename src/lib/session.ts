@@ -7,7 +7,7 @@ import {
   type PeerRole,
   type RoomInfo,
 } from "../../shared/protocol";
-import { ApiError, apiHeartbeat, apiHostAction, apiJoin, apiSendMessage } from "./api";
+import { ApiError, API_BASE, apiHeartbeat, apiHostAction, apiJoin, apiSendMessage } from "./api";
 
 export interface SessionEventEnvelope {
   id: string;
@@ -45,7 +45,6 @@ export class RoomSession {
   private abort: AbortController | null = null;
   private heartbeatTimer: number | null = null;
   private reconnectTimer: number | null = null;
-  private status: "connecting" | "live" | "reconnecting" = "connecting";
   private processedIds = new Set<string>();
   private lastProcessedId: string | null = null;
 
@@ -62,7 +61,6 @@ export class RoomSession {
   }
 
   private setStatus(s: "connecting" | "live" | "reconnecting"): void {
-    this.status = s;
     this.cb.onStatus(s);
   }
 
@@ -123,27 +121,50 @@ export class RoomSession {
   }
 
   private async sseLoop(): Promise<void> {
+    // quickEnds menghitung stream yang berakhir terlalu cepat/gagal beruntun.
+    // Siklus normal (server menutup stream tiap ±50 dtk karena batas durasi
+    // function) TIDAK mengubah status - reconnect dilakukan senyap karena
+    // cursor menjamin tidak ada event yang hilang.
+    let quickEnds = 0;
     while (!this.stopped) {
-      this.setStatus(this.status === "live" ? "reconnecting" : this.status);
+      const startedAt = Date.now();
+      let streamFailed = false;
       try {
         await this.openStream();
-        if (this.stopped) return;
-        // Stream berakhir normal (batas durasi server) - reconnect setelah jeda.
-        this.setStatus("reconnecting");
       } catch {
-        if (this.stopped) return;
-        this.setStatus("reconnecting");
+        streamFailed = true;
       }
-      await sleep(1200 + Math.random() * 800);
-      // Pastikan sesi masih hidup sebelum reconnect.
-      try {
-        await apiHeartbeat(this.creds.code, { peerId: this.peerId, token: this.token });
-      } catch (error) {
-        if (error instanceof ApiError && error.status === 401) {
-          if (!(await this.rejoin())) return;
-        } else if (error instanceof ApiError && error.status === 404) {
-          this.fatal("closed", error.message || "Room ditutup atau sudah kedaluwarsa.");
-          return;
+      if (this.stopped) return;
+
+      const duration = Date.now() - startedAt;
+      // Berakhir normal setelah >1,5 dtk = siklus periodik yang sehat (server
+      // memang menutup stream di batas durasi function; cursor menjaga event).
+      // Gagal/berakhir sangat cepat = mencurigakan → hitung untuk backoff.
+      if (!streamFailed && duration >= 1_500) quickEnds = 0;
+      else quickEnds = Math.min(quickEnds + 1, 10);
+
+      const degraded = streamFailed || quickEnds >= 2;
+      if (degraded) this.setStatus("reconnecting");
+      // else: status dibiarkan "live" (reconnect senyap)
+
+      const delay = degraded
+        ? Math.min(1_000 * quickEnds + Math.random() * 800, 8_000)
+        : 200 + Math.random() * 300;
+      await sleep(delay);
+      if (this.stopped) return;
+
+      // Hanya pada jalur bermasalah: pastikan sesi masih hidup sebelum reconnect.
+      if (degraded) {
+        try {
+          await apiHeartbeat(this.creds.code, { peerId: this.peerId, token: this.token });
+        } catch (error) {
+          if (this.stopped) return;
+          if (error instanceof ApiError && error.status === 401) {
+            if (!(await this.rejoin())) return;
+          } else if (error instanceof ApiError && error.status === 404) {
+            this.fatal("closed", error.message || "Room ditutup atau sudah kedaluwarsa.");
+            return;
+          }
         }
       }
     }
@@ -153,11 +174,31 @@ export class RoomSession {
     this.abort = new AbortController();
     const params = new URLSearchParams({ peerId: this.peerId });
     if (this.cursor) params.set("cursor", this.cursor);
-    const response = await fetch(`/api/rooms/${encodeURIComponent(this.creds.code)}/events?${params}`, {
-      headers: { Authorization: `Bearer ${this.token}`, Accept: "text/event-stream" },
-      signal: this.abort.signal,
-    });
-    if (!response.ok || !response.body) throw new Error(`SSE HTTP ${response.status}`);
+    const response = await fetch(
+      `${API_BASE}/api/rooms/${encodeURIComponent(this.creds.code)}/events?${params}`,
+      {
+        headers: { Authorization: `Bearer ${this.token}`, Accept: "text/event-stream" },
+        signal: this.abort.signal,
+      },
+    );
+    if (!response.ok) {
+      let message = `SSE HTTP ${response.status}`;
+      let code = "";
+      try {
+        const body = (await response.json()) as { error?: string; message?: string };
+        code = body.error ?? "";
+        if (body.message) message = body.message;
+      } catch {
+        /* body bukan JSON */
+      }
+      if (response.status === 503 || code === "STORAGE_NOT_CONFIGURED") {
+        // Server salah konfigurasi - jangan loop tanpa ujung.
+        this.fatal("session-lost", message);
+        throw new Error("FATAL");
+      }
+      throw new Error(message);
+    }
+    if (!response.body) throw new Error("SSE tanpa body");
     this.setStatus("live");
 
     const reader = response.body.getReader();
@@ -252,7 +293,7 @@ export class RoomSession {
     this.stopInternal(false);
     if (payload.peerId) {
       // best-effort; pakai keepalive agar tetap terkirim saat tab ditutup.
-      fetch(`/api/rooms/${encodeURIComponent(code)}/leave`, {
+      fetch(`${API_BASE}/api/rooms/${encodeURIComponent(code)}/leave`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(payload),

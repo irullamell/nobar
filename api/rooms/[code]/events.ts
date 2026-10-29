@@ -54,9 +54,14 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
   if (flush) (res as ServerResponse & { flushHeaders: () => void }).flushHeaders();
 
   try {
+    // Durasi maksimum satu koneksi SSE. Default mengikuti batas function;
+    // PIIK_SSE_MAX_MS hanya untuk pengujian.
+    const maxMs = Number(process.env.PIIK_SSE_MAX_MS ?? "") > 0
+      ? Number(process.env.PIIK_SSE_MAX_MS)
+      : SSE_MAX_DURATION_MS;
     await streamEvents(
       code,
-      { peerId, token, cursor: cursor || null, maxMs: SSE_MAX_DURATION_MS },
+      { peerId, token, cursor: cursor || null, maxMs },
       {
         emit(id, type, data) {
           if (closed) return;
